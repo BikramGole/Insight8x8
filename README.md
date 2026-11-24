@@ -106,5 +106,4 @@ Only public Chess.com profile, statistics, and game archive data is requested. N
 
 Third-party `python-chess` is vendored under its terms in `vendor/CHESS_LICENSE.txt`. Stockfish is not bundled; install it separately if you want local engine analysis.
 =======
-This is a Readme.
 >>>>>>> origin/main
