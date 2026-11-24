@@ -221,7 +221,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+<<<<<<< HEAD
 
 # SQLite sidecar files
 *.db-shm
 *.db-wal
+=======
+>>>>>>> origin/main
