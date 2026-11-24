@@ -68,6 +68,9 @@ Chess.com accuracy is used when the source provides it. Insight8x8 never invents
 | Stockfish executable | Engine settings or `STOCKFISH_PATH` | Detected from `PATH` |
 | Search depth | Engine settings | 12 |
 | Time per position | Engine settings | 150 ms |
+| Engine startup timeout | `STOCKFISH_STARTUP_TIMEOUT` | 5 s |
+| Engine response timeout | `STOCKFISH_RESPONSE_TIMEOUT` | 10 s |
+| Engine stop timeout | `STOCKFISH_STOP_TIMEOUT` | 2 s |
 | Local database | `INSIGHT8X8_DB` | `data/insight8x8.db` |
 | Chess.com user agent | `CHESSCOM_USER_AGENT` | `Insight8x8/1.0 (...)` |
 | Chess.com request interval | `CHESSCOM_MIN_INTERVAL` | Built-in rate limit |
@@ -105,6 +108,4 @@ Only public Chess.com profile, statistics, and game archive data is requested. N
 ## License
 
 Third-party `python-chess` is vendored under its terms in `vendor/CHESS_LICENSE.txt`. Stockfish is not bundled; install it separately if you want local engine analysis.
-=======
-This is a Readme.
 >>>>>>> origin/main

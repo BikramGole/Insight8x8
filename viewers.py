@@ -1,11 +1,9 @@
-import io
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
 
 import chess
-import chess.pgn
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QFont, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
@@ -27,7 +25,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from engine import format_score
+from engine import format_score, validate_pgn
 from ui_widgets import ChessBoard, captured_pieces
 from utils import fmt_date, fmt_duration, fmt_number, result_text
 from workers import AnalysisWorker
@@ -50,6 +48,7 @@ class GameViewerDialog(QWidget):
         self.timer.timeout.connect(self._advance)
         self.worker = None
         self._closed = False
+        self.pgn_error = ""
         self.game_analysis = None
         self.setWindowTitle(f"{game.get('white', '')} vs {game.get('black', '')} — Insight8x8")
         self.resize(1240, 820)
@@ -66,34 +65,34 @@ class GameViewerDialog(QWidget):
         positions = []
         moves = []
         try:
-            parsed = chess.pgn.read_game(io.StringIO(self.game.get("pgn") or ""))
-            if parsed is None:
-                raise ValueError("PGN is empty")
-            board = parsed.board()
+            _, parsed = validate_pgn(self.game.get("pgn"))
+        except ValueError as error:
+            self.pgn_error = str(error)
+            self.positions = [start_fen]
+            self.moves = moves
+            return
+        board = parsed.board()
+        positions.append(board.fen())
+        for move in parsed.mainline_moves():
+            san = board.san(move)
+            from_square = chess.square_name(move.from_square)
+            to_square = chess.square_name(move.to_square)
+            captured = board.piece_at(move.to_square)
+            captured_symbol = captured.symbol().lower() if captured else ""
+            if board.is_en_passant(move):
+                captured_symbol = "p"
+            board.push(move)
+            moves.append(
+                {
+                    "san": san,
+                    "from": from_square,
+                    "to": to_square,
+                    "uci": move.uci(),
+                    "captured": captured_symbol,
+                    "color": "w" if len(moves) % 2 == 0 else "b",
+                }
+            )
             positions.append(board.fen())
-            for move in parsed.mainline_moves():
-                san = board.san(move)
-                from_square = chess.square_name(move.from_square)
-                to_square = chess.square_name(move.to_square)
-                captured = board.piece_at(move.to_square)
-                captured_symbol = captured.symbol().lower() if captured else ""
-                if board.is_en_passant(move):
-                    captured_symbol = "p"
-                board.push(move)
-                moves.append(
-                    {
-                        "san": san,
-                        "from": from_square,
-                        "to": to_square,
-                        "uci": move.uci(),
-                        "captured": captured_symbol,
-                        "color": "w" if len(moves) % 2 == 0 else "b",
-                    }
-                )
-                positions.append(board.fen())
-        except Exception:
-            positions = []
-            moves = []
         self.positions = positions or [start_fen]
         self.moves = moves
 
@@ -272,10 +271,14 @@ class GameViewerDialog(QWidget):
         self.analysis_progress = QLabel()
         self.analysis_progress.setObjectName("muted")
         self.analysis_progress.setWordWrap(True)
-        if not self.moves:
+        if self.pgn_error:
+            self.analysis_progress.setText(f"PGN problem: {self.pgn_error}")
+        elif not self.moves:
             self.analysis_progress.setText("This game has no replayable moves in the cached PGN.")
         elif not (self.analyzer and self.analyzer.available):
-            self.analysis_progress.setText("Stockfish is not configured. Use Engine settings to locate it.")
+            path_error = getattr(self.analyzer, "path_error", "") if self.analyzer else ""
+            message = path_error or "Stockfish is not configured."
+            self.analysis_progress.setText(f"{message} Use Engine settings to locate it.")
         else:
             self.analysis_progress.setText(
                 f"Stockfish ready · depth {self.depth} · {self.movetime} ms per position"

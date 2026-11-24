@@ -25,6 +25,8 @@ from engine import (
     classify_loss,
     format_score,
     score_value,
+    validate_fen,
+    validate_pgn,
 )
 from store import Store
 from ui_widgets import captured_pieces
@@ -253,7 +255,12 @@ class Insight8x8Tests(unittest.TestCase):
                                 command = line.strip()
                                 log.write(command + "\\n")
                                 log.flush()
-                                if command.startswith("go"):
+                                if command == "uci":
+                                    print("id name Fake Engine", flush=True)
+                                    print("uciok", flush=True)
+                                elif command == "isready":
+                                    print("readyok", flush=True)
+                                elif command.startswith("go"):
                                     print("info depth 6 multipv 1 score cp 25 pv e2e4 e7e5", flush=True)
                                     print("info depth 6 multipv 2 score cp 18 pv d2d4 d7d5", flush=True)
                                     print("info depth 6 multipv 3 score cp 12 pv c2c4", flush=True)
@@ -266,7 +273,12 @@ class Insight8x8Tests(unittest.TestCase):
             os.chmod(path, 0o755)
             with patch.dict(
                 os.environ,
-                {"STOCKFISH_PATH": path, "STOCKFISH_LOG": commands_path},
+                {
+                    "STOCKFISH_PATH": path,
+                    "STOCKFISH_LOG": commands_path,
+                    "STOCKFISH_STARTUP_TIMEOUT": "0.5",
+                    "STOCKFISH_RESPONSE_TIMEOUT": "0.5",
+                },
             ):
                 analyzer = StockfishAnalyzer()
                 self.assertTrue(analyzer.available)
@@ -384,6 +396,95 @@ class Insight8x8Tests(unittest.TestCase):
                 profile = client.profile("hikaru")
             self.assertEqual(profile["countryUrl"], country)
             self.assertEqual(profile["country"], "United States")
+
+    def test_validate_fen_rejects_invalid_positions(self):
+        start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        self.assertEqual(validate_fen("  " + start + "  "), start)
+        for value in ("", "x" * 300, "not a fen", "8/8/8/8/8/8/8/8 w - - 0 1"):
+            with self.assertRaises(ValueError):
+                validate_fen(value)
+
+    def test_analyze_positions_rejects_invalid_fen(self):
+        analyzer = StockfishAnalyzer()
+        analyzer.available = True
+        with self.assertRaises(ChessComError):
+            analyzer.analyze_positions(["not a fen"])
+
+    def test_validate_pgn_rejects_empty_and_moveless_games(self):
+        text, game = validate_pgn(PGN)
+        self.assertEqual(text, PGN.strip())
+        self.assertEqual(len(list(game.mainline_moves())), 6)
+        for value in ("", "x" * 200001, '[Event "Empty"]\n\n1-0\n'):
+            with self.assertRaises(ValueError):
+                validate_pgn(value)
+
+    def test_engine_reports_invalid_path_and_start_failure(self):
+        analyzer = StockfishAnalyzer("/definitely/not/stockfish")
+        self.assertTrue(analyzer.path_error)
+        analyzer.available = True
+        with patch("engine.subprocess.Popen", side_effect=OSError("missing engine")):
+            with self.assertRaises(ChessComError):
+                analyzer.analyze_positions(
+                    ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"]
+                )
+
+    def test_engine_stops_stalled_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "stalling-engine")
+            commands_path = os.path.join(directory, "commands.log")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    textwrap.dedent(
+                        """\
+                        #!/usr/bin/env python3
+                        import os
+                        import sys
+                        seen_go = False
+                        with open(os.environ["STOCKFISH_LOG"], "a", encoding="utf-8") as log:
+                            for line in sys.stdin:
+                                command = line.strip()
+                                log.write(command + "\\n")
+                                log.flush()
+                                if command == "uci":
+                                    print("uciok", flush=True)
+                                elif command == "isready":
+                                    print("readyok", flush=True)
+                                elif command.startswith("go"):
+                                    if seen_go:
+                                        print("info depth 4 multipv 1 score cp 10 pv e2e4", flush=True)
+                                        print("bestmove e2e4", flush=True)
+                                    seen_go = True
+                                elif command == "stop":
+                                    print("bestmove e2e4", flush=True)
+                                elif command == "quit":
+                                    break
+                        """
+                    )
+                )
+            os.chmod(path, 0o755)
+            with patch.dict(
+                os.environ,
+                {
+                    "STOCKFISH_PATH": path,
+                    "STOCKFISH_LOG": commands_path,
+                    "STOCKFISH_STARTUP_TIMEOUT": "0.3",
+                    "STOCKFISH_RESPONSE_TIMEOUT": "0.2",
+                    "STOCKFISH_STOP_TIMEOUT": "0.5",
+                },
+            ):
+                analyzer = StockfishAnalyzer()
+                results = analyzer.analyze_positions(
+                    [
+                        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+                    ],
+                    movetime=50,
+                )
+            with open(commands_path, encoding="utf-8") as handle:
+                commands = [line.strip() for line in handle if line.strip()]
+            self.assertEqual(commands.count("stop"), 1, (commands, results))
+            self.assertEqual(commands.count("uci"), 1, commands)
+            self.assertEqual([item["bestMove"] for item in results], ["e2e4", "e2e4"])
 
 
 class Insight8x8GuiTests(unittest.TestCase):
@@ -507,6 +608,21 @@ class Insight8x8GuiTests(unittest.TestCase):
                 self.assertEqual(viewer.movetime, 200)
                 self.assertTrue(viewer.engine_button.isEnabled() or not viewer.analyzer.available)
                 self.assertIsNotNone(viewer.settings_button)
+            finally:
+                viewer.close()
+        finally:
+            window.close()
+
+    def test_viewer_reports_invalid_pgn(self):
+        from viewers import GameViewerDialog
+
+        window = self.make_window()
+        try:
+            viewer = GameViewerDialog({"pgn": "", "white": "A", "black": "B"}, window.analyzer)
+            try:
+                self.assertEqual(viewer.pgn_error, "PGN is empty.")
+                self.assertFalse(viewer.moves)
+                self.assertIn("PGN problem", viewer.analysis_progress.text())
             finally:
                 viewer.close()
         finally:
