@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 
 from intelligence import recurring_weaknesses, why_is_better
 
@@ -16,6 +17,29 @@ LLM_URL_ENV = "INSIGHT8X8_LLM_URL"
 LLM_KEY_ENV = "INSIGHT8X8_LLM_KEY"
 LLM_MODEL_ENV = "INSIGHT8X8_LLM_MODEL"
 LLM_TIMEOUT_ENV = "INSIGHT8X8_LLM_TIMEOUT"
+ENV_FILE_ENV = "INSIGHT8X8_ENV_FILE"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+
+def load_env_file(path=None):
+    candidate = Path(
+        path or os.environ.get(ENV_FILE_ENV, Path(__file__).resolve().parent / ".env")
+    )
+    if not candidate.is_file():
+        return False
+    loaded = False
+    for raw in candidate.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+            loaded = True
+    return loaded
 
 
 class LLMCoach:
@@ -24,7 +48,11 @@ class LLMCoach:
     def __init__(self, url=None, key=None, model=None, timeout=None):
         self.url = str(url or os.environ.get(LLM_URL_ENV, "")).strip()
         self.key = str(key or os.environ.get(LLM_KEY_ENV, "")).strip()
-        self.model = str(model or os.environ.get(LLM_MODEL_ENV, "gpt-4o-mini")).strip() or "gpt-4o-mini"
+        configured_model = model if model is not None else os.environ.get(LLM_MODEL_ENV, "")
+        default_model = GROQ_MODEL if self.key.startswith("gsk_") else "gpt-4o-mini"
+        self.model = str(configured_model or default_model).strip() or default_model
+        if not self.url and self.key.startswith("gsk_"):
+            self.url = GROQ_URL
         try:
             self.timeout = float(timeout or os.environ.get(LLM_TIMEOUT_ENV, 8))
         except (TypeError, ValueError):
@@ -59,7 +87,8 @@ class LLMCoach:
                 body = json.loads(response.read().decode("utf-8", "replace"))
             return (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
         except (urllib.error.URLError, ValueError, KeyError, IndexError, TimeoutError, OSError) as error:
-            self.last_error = type(error).__name__
+            status = getattr(error, "code", "")
+            self.last_error = f"{type(error).__name__}{f' {status}' if status else ''}"
             raise RuntimeError(f"LLM request failed ({self.last_error}).") from error
 
 

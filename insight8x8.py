@@ -44,6 +44,7 @@ from chesscom import ChessComClient, validate_username
 from coaching import (
     LLMCoach,
     build_coaching_data,
+    load_env_file,
     improvement_summary,
     progress_history,
     record_progress,
@@ -2130,6 +2131,7 @@ class Insight8x8App(QMainWindow):
 
 
 def main():
+    load_env_file()
     app = QApplication(sys.argv)
     app.setApplicationName("Insight8x8")
     app.setOrganizationName("Insight8x8")

@@ -84,28 +84,35 @@ Chess.com accuracy is used when the source provides it. Insight8x8 never invents
 | Engine startup timeout | `STOCKFISH_STARTUP_TIMEOUT` | 5 s |
 | Engine response timeout | `STOCKFISH_RESPONSE_TIMEOUT` | 10 s |
 | Engine stop timeout | `STOCKFISH_STOP_TIMEOUT` | 2 s |
-| LLM chat endpoint | Welcome dialog or `INSIGHT8X8_LLM_URL` | Disabled |
-| LLM model | Welcome dialog or `INSIGHT8X8_LLM_MODEL` | `gpt-4o-mini` |
-| LLM API key | `INSIGHT8X8_LLM_KEY` (recommended) or welcome dialog | Disabled |
+| LLM chat endpoint | `.env`, `INSIGHT8X8_LLM_URL`, or welcome dialog | Groq auto-detected for `gsk_` keys; otherwise disabled |
+| LLM model | `.env`, `INSIGHT8X8_LLM_MODEL`, or welcome dialog | `openai/gpt-oss-120b` for Groq; otherwise `gpt-4o-mini` |
+| LLM API key | `.env` or `INSIGHT8X8_LLM_KEY` (recommended) | Disabled |
 | LLM request timeout | `INSIGHT8X8_LLM_TIMEOUT` | 8 s |
+| Local env file | `.env` or `INSIGHT8X8_ENV_FILE` | `.env` in the project directory |
 | Local database | `INSIGHT8X8_DB` | `data/insight8x8.db` |
 | Chess.com user agent | `CHESSCOM_USER_AGENT` | `Insight8x8/1.0 (...)` |
 | Chess.com request interval | `CHESSCOM_MIN_INTERVAL` | Built-in rate limit |
 | Chess.com workers | `CHESSCOM_MAX_WORKERS` | Built-in parallel limit |
 
-Settings such as the last username, engine path, depth, movetime, LLM endpoint, and LLM model are stored with `QSettings`; cached games, favorites, analyses, and training sessions are stored in the local SQLite database.
+Settings such as the last username, engine path, depth, movetime, LLM endpoint, and LLM model are stored with `QSettings`; cached games, favorites, analyses, and training sessions are stored in the local SQLite database. API keys are never written to `QSettings`, the SQLite database, or logs.
 
 ### Optional LLM coaching
 
-Local coaching is always available and never needs the network. To enrich lesson wording with an OpenAI-compatible chat endpoint, set:
+Local coaching is always available and never needs the network. For Groq, the endpoint and model are auto-detected from a `gsk_` key; a minimal `.env` is enough:
 
-```bash
-export INSIGHT8X8_LLM_URL="https://api.example.com/v1/chat/completions"
-export INSIGHT8X8_LLM_KEY="your-api-key"
-export INSIGHT8X8_LLM_MODEL="gpt-4o-mini"
+```dotenv
+INSIGHT8X8_LLM_KEY=your-groq-api-key
 ```
 
-The adapter is only activated when both a URL and an API key are present. If the request fails, Insight8x8 silently falls back to local lessons. The API key entered in the welcome dialog is kept for that session only; setting `INSIGHT8X8_LLM_KEY` is the persistent option.
+`.env`, `.env.*`, `*.env`, `*.key`, `*.pem`, and `secrets/` are ignored by `.gitignore`. Never put a real key in README, source files, tests, or commit messages. If you prefer environment variables, export them in your shell instead:
+
+```bash
+export INSIGHT8X8_LLM_URL="https://api.groq.com/openai/v1/chat/completions"
+export INSIGHT8X8_LLM_MODEL="openai/gpt-oss-120b"
+export INSIGHT8X8_LLM_KEY="your-groq-api-key"
+```
+
+The adapter is only activated when both a URL and an API key are present. If the request fails, Insight8x8 silently falls back to local lessons. The API key entered in the welcome dialog is kept for that session only; `.env` or `INSIGHT8X8_LLM_KEY` is the persistent option.
 
 ## Project structure
 
@@ -123,17 +130,18 @@ utils.py             Formatting and filter helpers
 test_insight8x8.py   Unit and GUI smoke tests
 vendor/chess/        Vendored python-chess (see vendor/CHESS_LICENSE.txt)
 data/                Local SQLite cache (generated at runtime)
+.env                 Local API keys (gitignored, never committed)
 ```
 
 ## Privacy
 
-Only public Chess.com profile, statistics, and game archive data is requested. No password is collected. Analysis, coaching, and progress tracking run locally through Stockfish and SQLite. Favorites, settings, cached archives, and training history stay on your machine. If you explicitly configure the optional LLM adapter, lesson text prompts are sent to that endpoint; no credentials are logged or written to the local database.
+Only public Chess.com profile, statistics, and game archive data is requested. No password is collected. Analysis, coaching, and progress tracking run locally through Stockfish and SQLite. Favorites, settings, cached archives, and training history stay on your machine. If you explicitly configure the optional LLM adapter, lesson text prompts are sent to that endpoint; no credentials are logged or written to `QSettings` or the local database. Keep keys in a gitignored `.env` file or shell environment.
 
 ## Troubleshooting
 
 - **"Stockfish is not configured"** — install Stockfish or select its executable in Engine settings.
 - **"No lessons yet"** — analyse at least one game, then choose **Build coaching** on the Training tab.
-- **LLM coaching not active** — both `INSIGHT8X8_LLM_URL` and `INSIGHT8X8_LLM_KEY` must be set; failed requests fall back to local lessons.
+- **LLM coaching not active** — set `INSIGHT8X8_LLM_KEY` (a `gsk_` key auto-selects Groq) or set both `INSIGHT8X8_LLM_URL` and `INSIGHT8X8_LLM_KEY`; failed requests fall back to local lessons.
 - **Archive warnings / offline mode** — Insight8x8 keeps previously cached games available and shows a retry hint; press `F5` when the connection returns.
 - **Large archive is slow** — lower the analysis depth or time per position in Engine settings; archive loading itself is cached after the first run.
 - **No games match filters** — use **Clear filters** to reset search, dates, sorting, and pagination.

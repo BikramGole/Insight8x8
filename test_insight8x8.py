@@ -19,9 +19,12 @@ from chesscom import (
     validate_username,
 )
 from coaching import (
+    GROQ_MODEL,
+    GROQ_URL,
     LLMCoach,
     generate_lessons,
     improvement_summary,
+    load_env_file,
     progress_history,
     record_progress,
     training_report,
@@ -602,6 +605,27 @@ class IntelligenceAndCoachingTests(unittest.TestCase):
             lessons = generate_lessons([weakness], llm=llm)
         self.assertEqual(lessons[0]["title"], "LLM lesson")
         self.assertEqual(lessons[0]["source"], "LLM")
+
+    def test_groq_key_autodetects_endpoint_and_model(self):
+        with patch.dict(os.environ, {}, clear=True):
+            coach = LLMCoach(key="gsk_test")
+        self.assertEqual(coach.url, GROQ_URL)
+        self.assertEqual(coach.model, GROQ_MODEL)
+        self.assertTrue(coach.available)
+
+    def test_env_file_values_are_loaded_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            from pathlib import Path
+
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "INSIGHT8X8_LLM_KEY=file-key\n# comment\nINSIGHT8X8_LLM_MODEL=file-model\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"INSIGHT8X8_LLM_MODEL": "shell-model"}, clear=True):
+                self.assertTrue(load_env_file(env_file))
+                self.assertEqual(os.environ["INSIGHT8X8_LLM_KEY"], "file-key")
+                self.assertEqual(os.environ["INSIGHT8X8_LLM_MODEL"], "shell-model")
 
 
 class Insight8x8GuiTests(unittest.TestCase):
