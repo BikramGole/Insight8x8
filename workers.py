@@ -23,13 +23,26 @@ class AnalysisWorker(QThread):
     succeeded = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, analyzer, fens, moves, depth=12, movetime=150):
+    def __init__(
+        self,
+        analyzer,
+        fens,
+        moves,
+        depth=12,
+        movetime=150,
+        player_rating=None,
+        opponent_rating=None,
+        player_color=None,
+    ):
         super().__init__()
         self.analyzer = analyzer
         self.fens = fens
         self.moves = moves
         self.depth = depth
         self.movetime = movetime
+        self.player_rating = player_rating
+        self.opponent_rating = opponent_rating
+        self.player_color = player_color
 
     def run(self):
         try:
@@ -42,6 +55,9 @@ class AnalysisWorker(QThread):
                 depth=self.depth,
                 movetime=self.movetime,
                 progress=progress,
+                player_rating=self.player_rating,
+                opponent_rating=self.opponent_rating,
+                player_color=self.player_color,
             )
             self.succeeded.emit(result)
         except Exception as error:

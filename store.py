@@ -37,6 +37,17 @@ class Store:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS training (
+                    username TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (username, key)
+                )
+                """
+            )
             self._conn.commit()
 
     def get_cache(self, key):
@@ -118,6 +129,56 @@ class Store:
                 (username.lower(), game_id),
             )
             self._conn.commit()
+
+    def get_training(self, username, key, default=None):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM training WHERE username = ? AND key = ?",
+                (str(username or "").lower(), key),
+            ).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (TypeError, ValueError):
+            return default
+
+    def set_training(self, username, key, value):
+        encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO training (username, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(username, key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (str(username or "").lower(), key, encoded, time.time()),
+            )
+            self._conn.commit()
+
+    def delete_training(self, username, key):
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM training WHERE username = ? AND key = ?",
+                (str(username or "").lower(), key),
+            )
+            self._conn.commit()
+
+    def all_training(self, username):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, value FROM training WHERE username = ? ORDER BY updated_at",
+                (str(username or "").lower(),),
+            ).fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[row["key"]] = json.loads(row["value"])
+            except (TypeError, ValueError):
+                continue
+        return result
 
     def close(self):
         with self._lock:

@@ -18,6 +18,14 @@ from chesscom import (
     parse_headers,
     validate_username,
 )
+from coaching import (
+    LLMCoach,
+    generate_lessons,
+    improvement_summary,
+    progress_history,
+    record_progress,
+    training_report,
+)
 from insight8x8 import compute_insights
 from engine import (
     StockfishAnalyzer,
@@ -27,6 +35,13 @@ from engine import (
     score_value,
     validate_fen,
     validate_pgn,
+)
+from intelligence import (
+    classify_loss_for_rating,
+    explain_positional_mistake,
+    recurring_weaknesses,
+    tactical_motifs,
+    why_is_better,
 )
 from store import Store
 from ui_widgets import captured_pieces
@@ -220,6 +235,9 @@ class Insight8x8Tests(unittest.TestCase):
         self.assertEqual(first["classification"], "best or good")
         self.assertEqual([candidate["san"] for candidate in first["candidates"]], ["e4", "d4", "c4"])
         self.assertEqual(first["candidates"][0]["pv"], ["e4", "e5", "Nf3"])
+        self.assertTrue(first["explanation"])
+        self.assertIn("e4", first["whyBetter"])
+        self.assertEqual(first["phase"], "opening")
         self.assertEqual(result["moves"][2]["classification"], "inaccuracy")
         self.assertEqual(result["moves"][3]["classification"], "blunder")
         self.assertTrue(any("Allowed a strong reply" in item["text"] for item in result["opportunities"]))
@@ -487,6 +505,105 @@ class Insight8x8Tests(unittest.TestCase):
             self.assertEqual([item["bestMove"] for item in results], ["e2e4", "e2e4"])
 
 
+class IntelligenceAndCoachingTests(unittest.TestCase):
+    def test_rating_aware_classification(self):
+        self.assertEqual(classify_loss_for_rating(30, 800), "best or good")
+        self.assertEqual(classify_loss_for_rating(40, 1500), "inaccuracy")
+        self.assertEqual(classify_loss_for_rating(70, 1500), "mistake")
+        self.assertEqual(classify_loss_for_rating(80, 2300), "blunder")
+        self.assertEqual(
+            classify_loss_for_rating(70, 2300, phase="endgame"), "blunder"
+        )
+
+    def test_tactical_motifs(self):
+        check = tactical_motifs("4k3/8/8/8/8/8/8/3QK3 w - - 0 1", "d1d8")
+        self.assertIn("check", check)
+        promotion = tactical_motifs("4k3/P7/8/8/8/8/8/4K3 w - - 0 1", "a7a8q")
+        self.assertIn("promotion", promotion)
+        self.assertEqual(tactical_motifs("not a fen", "e2e4"), [])
+
+    def test_explanation_and_better_move(self):
+        explanation = explain_positional_mistake(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
+            "a2a3",
+        )
+        self.assertTrue(explanation)
+        text = why_is_better(
+            {
+                "bestMoveSan": "e4",
+                "centipawnLoss": 80,
+                "phase": "opening",
+                "replySan": "d5",
+                "bestMotifs": ["fork"],
+                "move": "a3",
+            }
+        )
+        self.assertIn("e4", text)
+        self.assertIn("fork", text)
+
+    def test_recurring_weaknesses(self):
+        analyses = [
+            {
+                "game_id": "g1",
+                "analysis": {
+                    "moves": {
+                        1: {
+                            "ply": 1,
+                            "classification": "blunder",
+                            "phase": "opening",
+                            "motifs": [],
+                            "explanation": "You gave up control of the centre",
+                        }
+                    }
+                },
+            }
+        ]
+        weaknesses = recurring_weaknesses(analyses)
+        keys = {item["key"] for item in weaknesses}
+        self.assertIn("decision_quality", keys)
+        self.assertIn("centre", keys)
+        self.assertEqual(weaknesses[0]["games"], 1)
+
+    def test_progress_and_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(os.path.join(directory, "training.db"))
+            try:
+                record_progress(store, "tester", {"focus": "Tactics", "correct": 1, "total": 2})
+                record_progress(store, "tester", {"focus": "Tactics", "correct": 2, "total": 2})
+                history = progress_history(store, "tester")
+                summary = improvement_summary(history)
+                self.assertEqual(summary["sessions"], 2)
+                self.assertEqual(summary["accuracy"], 75.0)
+                self.assertEqual(summary["trend"], 50.0)
+                report = training_report(store, "tester", [], [], history)
+                self.assertIn("Insight8x8 training report", report)
+                self.assertIn("75.0", report)
+            finally:
+                store.close()
+
+    def test_llm_adapter_is_optional(self):
+        with patch.dict(os.environ, {}, clear=True):
+            coach = LLMCoach()
+            self.assertFalse(coach.available)
+            lessons = generate_lessons([], llm=coach)
+            self.assertEqual(lessons[0]["id"], "lesson-start")
+        llm = LLMCoach(url="https://example.test/v1/chat/completions", key="secret")
+        self.assertTrue(llm.available)
+        weakness = {
+            "key": "decision_quality",
+            "title": "Decision quality",
+            "detail": "Repeated mistakes",
+            "count": 4,
+            "severity": "medium",
+        }
+        payload = '{"lessons":[{"title":"LLM lesson","summary":"s","focus":"f","steps":["a"]}]}'
+        with patch.object(llm, "generate", return_value=payload):
+            lessons = generate_lessons([weakness], llm=llm)
+        self.assertEqual(lessons[0]["title"], "LLM lesson")
+        self.assertEqual(lessons[0]["source"], "LLM")
+
+
 class Insight8x8GuiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -610,6 +727,20 @@ class Insight8x8GuiTests(unittest.TestCase):
                 self.assertIsNotNone(viewer.settings_button)
             finally:
                 viewer.close()
+        finally:
+            window.close()
+
+    def test_training_and_progress_tabs(self):
+        window = self.make_window()
+        try:
+            self.assertIn("training", window.nav_buttons)
+            self.assertIn("progress", window.nav_buttons)
+            window.show_tab("training")
+            self.assertEqual(window.page_title.text(), "Training")
+            window.show_tab("progress")
+            self.assertEqual(window.page_title.text(), "Progress")
+            report = window._export_text("training_report")
+            self.assertIn("Insight8x8 training report", report)
         finally:
             window.close()
 

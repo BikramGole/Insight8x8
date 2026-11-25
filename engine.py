@@ -15,6 +15,13 @@ import chess
 import chess.pgn
 
 from chesscom import ChessComError
+from intelligence import (
+    classify_loss_for_rating,
+    explain_positional_mistake,
+    phase_for_ply,
+    tactical_motifs,
+    why_is_better,
+)
 
 MATE_SCORE = 10000
 MAX_FEN_LENGTH = 200
@@ -181,7 +188,15 @@ def _find_opportunities(before, after, best_san, best_candidate, reply_score, re
     return items
 
 
-def build_game_analysis(fens, moves, positions, multipv=3):
+def build_game_analysis(
+    fens,
+    moves,
+    positions,
+    multipv=3,
+    player_rating=None,
+    opponent_rating=None,
+    player_color=None,
+):
     entries = {}
     opportunities = []
     summary = {
@@ -212,7 +227,15 @@ def build_game_analysis(fens, moves, positions, multipv=3):
         best_value = score_value(eval_before)
         played_value = score_value(eval_after)
         loss = max(0, best_value - played_value) if best_value is not None and played_value is not None else None
-        classification = classify_loss(loss)
+        phase = phase_for_ply(ply - 1, chess.Board(before_fen) if before_fen else None)
+        mover_rating = player_rating if mover == player_color else opponent_rating
+        classification = (
+            classify_loss_for_rating(loss, mover_rating, phase)
+            if mover_rating is not None
+            else classify_loss(loss)
+        )
+        best_motifs = tactical_motifs(before_fen, best_uci) if best_uci else []
+        played_motifs = tactical_motifs(before_fen, move.get("uci")) if move.get("uci") else []
         candidates = []
         for index, candidate in enumerate(raw_candidates[:multipv], start=1):
             uci = candidate.get("move")
@@ -241,21 +264,31 @@ def build_game_analysis(fens, moves, positions, multipv=3):
             reply_raw.get("score"),
             reply_san,
         )
-        entries[ply] = {
+        if classification in ("mistake", "blunder") and best_motifs:
+            themes = ", ".join(best_motifs[:2])
+            move_opportunities.insert(0, f"{best_san} available: {themes}")
+        entry = {
             "ply": ply,
             "move": move.get("san"),
             "color": mover,
+            "phase": phase,
             "bestMove": best_uci,
             "bestMoveSan": best_san,
             "playedMove": move.get("uci"),
+            "fen": before_fen,
             "evalBefore": eval_before,
             "evalAfter": eval_after,
             "centipawnLoss": loss,
             "classification": classification,
             "candidates": candidates,
             "replySan": reply_san,
+            "motifs": played_motifs,
+            "bestMotifs": best_motifs,
             "tacticalOpportunities": move_opportunities,
+            "explanation": explain_positional_mistake(before_fen, after_fen, move.get("uci")),
         }
+        entry["whyBetter"] = why_is_better(entry)
+        entries[ply] = entry
         for text in move_opportunities:
             opportunities.append({"ply": ply, "move": move.get("san"), "color": mover, "text": text})
         if classification:
@@ -484,13 +517,32 @@ class StockfishAnalyzer:
             self._stop_process(session)
         return positions
 
-    def analyze_game(self, fens, moves, depth=12, movetime=150, multipv=3, progress=None):
+    def analyze_game(
+        self,
+        fens,
+        moves,
+        depth=12,
+        movetime=150,
+        multipv=3,
+        progress=None,
+        player_rating=None,
+        opponent_rating=None,
+        player_color=None,
+    ):
         if len(fens) != len(moves) + 1:
             raise ChessComError("Analysis needs one position per move plus the starting position.")
         positions = self.analyze_positions(
             fens, depth=depth, movetime=movetime, multipv=multipv, progress=progress
         )
-        return build_game_analysis(fens, moves, positions, multipv=multipv)
+        return build_game_analysis(
+            fens,
+            moves,
+            positions,
+            multipv=multipv,
+            player_rating=player_rating,
+            opponent_rating=opponent_rating,
+            player_color=player_color,
+        )
 
     def analyze(self, fen, depth=12, movetime=400):
         position = self.analyze_positions([fen], depth=depth, movetime=movetime, multipv=3)[0]

@@ -12,6 +12,7 @@ from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -40,6 +41,14 @@ from PyQt6.QtWidgets import (
 )
 
 from chesscom import ChessComClient, validate_username
+from coaching import (
+    LLMCoach,
+    build_coaching_data,
+    improvement_summary,
+    progress_history,
+    record_progress,
+    training_report,
+)
 from engine import StockfishAnalyzer
 from store import Store
 from ui_widgets import (
@@ -258,6 +267,81 @@ class EngineSettingsDialog(QDialog):
         }
 
 
+class OnboardingDialog(QDialog):
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.setWindowTitle("Welcome to Insight8x8")
+        self.setMinimumWidth(540)
+        form = QFormLayout(self)
+        form.setContentsMargins(24, 22, 24, 22)
+        form.setSpacing(12)
+        intro = QLabel("Analyse your Chess.com games locally, then turn repeated mistakes into training.")
+        intro.setObjectName("viewerTitle")
+        intro.setWordWrap(True)
+        form.addRow(intro)
+        self.username_input = QLineEdit(settings.value("username", "", type=str))
+        self.username_input.setPlaceholderText("Chess.com username")
+        form.addRow("Username", self.username_input)
+        engine_row = QHBoxLayout()
+        self.engine_input = QLineEdit(settings.value("enginePath", "", type=str))
+        self.engine_input.setPlaceholderText("Leave empty to use Stockfish from PATH")
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        engine_row.addWidget(self.engine_input, 1)
+        engine_row.addWidget(browse)
+        form.addRow("Stockfish", engine_row)
+        self.focus_input = QComboBox()
+        self.focus_input.addItems(["Balanced", "Tactics", "Openings", "Endgame"])
+        self.focus_input.setCurrentText(settings.value("coachingFocus", "Balanced", type=str))
+        form.addRow("Training focus", self.focus_input)
+        self.llm_check = QCheckBox("Enable optional LLM coaching (advanced)")
+        url = settings.value("llmUrl", "", type=str)
+        self.llm_check.setChecked(bool(url))
+        form.addRow(self.llm_check)
+        self.llm_url = QLineEdit(url)
+        self.llm_url.setPlaceholderText("https://api.example.com/v1/chat/completions")
+        self.llm_model = QLineEdit(settings.value("llmModel", "gpt-4o-mini", type=str))
+        self.llm_key = QLineEdit(os.environ.get("INSIGHT8X8_LLM_KEY", ""))
+        self.llm_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.llm_key.setPlaceholderText("Session only, or set INSIGHT8X8_LLM_KEY")
+        form.addRow("LLM endpoint", self.llm_url)
+        form.addRow("LLM model", self.llm_model)
+        form.addRow("LLM API key", self.llm_key)
+        note = QLabel("Local coaching works without any network access. The LLM key is never written to disk.")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        form.addRow(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.llm_check.toggled.connect(self._toggle_llm)
+        self._toggle_llm(self.llm_check.isChecked())
+
+    def _toggle_llm(self, checked):
+        for field in (self.llm_url, self.llm_model, self.llm_key):
+            field.setEnabled(checked)
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Locate Stockfish", self.engine_input.text() or str(Path.home()))
+        if path:
+            self.engine_input.setText(path)
+
+    def values(self):
+        return {
+            "username": self.username_input.text().strip(),
+            "enginePath": self.engine_input.text().strip(),
+            "coachingFocus": self.focus_input.currentText(),
+            "llmEnabled": self.llm_check.isChecked(),
+            "llmUrl": self.llm_url.text().strip() if self.llm_check.isChecked() else "",
+            "llmModel": self.llm_model.text().strip() or "gpt-4o-mini",
+            "llmKey": self.llm_key.text().strip() if self.llm_check.isChecked() else "",
+        }
+
+
 class Insight8x8App(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -280,6 +364,16 @@ class Insight8x8App(QMainWindow):
             False: self._default_filters(),
             True: self._default_filters(),
         }
+        self.training = {
+            "lessons": [],
+            "exercises": [],
+            "weaknesses": [],
+            "current": None,
+            "index": 0,
+            "correct": 0,
+            "answered": 0,
+        }
+        self.coach = LLMCoach()
         self.setWindowTitle("Insight8x8 — AI-powered chess analysis")
         self.resize(1440, 900)
         self.setMinimumSize(1024, 680)
@@ -291,6 +385,8 @@ class Insight8x8App(QMainWindow):
         self._build_shortcuts()
         self._refresh_engine_status()
         self.status.showMessage("Ready · Enter a Chess.com username to begin")
+        if not self.settings.value("onboardingComplete", False, type=bool):
+            QTimer.singleShot(60, self._run_onboarding)
         saved = self.settings.value("username", "", type=str)
         if saved:
             QTimer.singleShot(120, lambda: self.connect_account(saved, silent=True))
@@ -314,7 +410,9 @@ class Insight8x8App(QMainWindow):
             ("Refresh archives", QKeySequence("F5"), lambda: self.start_archive_load(refresh=True)),
             ("Engine settings", QKeySequence("Ctrl+,"), self._open_settings),
         ]
-        for index, key in enumerate(("overview", "games", "openings", "compare", "favorites", "export"), 1):
+        for index, key in enumerate(
+            ("overview", "games", "openings", "compare", "favorites", "training", "progress", "export"), 1
+        ):
             shortcuts.append((f"Open {key}", QKeySequence(f"Ctrl+{index}"), lambda checked=False, value=key: self.show_tab(value)))
         for text, sequence, handler in shortcuts:
             action = QAction(text, self)
@@ -338,6 +436,32 @@ class Insight8x8App(QMainWindow):
         state = "ready" if self.analyzer.available else "not configured"
         self.status.showMessage(
             f"Engine settings saved · Stockfish {state} · depth {values['analysisDepth']}"
+        )
+
+    def _run_onboarding(self):
+        dialog = OnboardingDialog(self.settings, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        for key, value in values.items():
+            if key not in ("llmKey", "llmEnabled"):
+                self.settings.setValue(key, value)
+        self.settings.setValue("onboardingComplete", True)
+        if values["username"]:
+            self.username_input.setText(values["username"])
+        self.analyzer.set_path(values["enginePath"])
+        self._apply_llm_settings(values)
+        self._refresh_engine_status()
+        self.status.showMessage("Welcome to Insight8x8 · connect your account to begin")
+
+    def _apply_llm_settings(self, values=None):
+        values = values or {}
+        if values.get("llmKey"):
+            os.environ["INSIGHT8X8_LLM_KEY"] = values["llmKey"]
+        self.coach = LLMCoach(
+            url=values.get("llmUrl", self.settings.value("llmUrl", "", type=str)),
+            key=values.get("llmKey") or os.environ.get("INSIGHT8X8_LLM_KEY", ""),
+            model=values.get("llmModel", self.settings.value("llmModel", "gpt-4o-mini", type=str)),
         )
 
     def _analysis_options(self):
@@ -540,6 +664,8 @@ class Insight8x8App(QMainWindow):
                 ("openings", "Openings"),
                 ("compare", "Compare players"),
                 ("favorites", "Favorite games"),
+                ("training", "Training"),
+                ("progress", "Progress"),
                 ("export", "Export center"),
             ),
             1,
@@ -598,8 +724,19 @@ class Insight8x8App(QMainWindow):
         self.favorites_page = self._build_games(True)
         self.openings_page = self._build_openings()
         self.compare_page = self._build_compare()
+        self.training_page = self._build_training()
+        self.progress_page = self._build_progress()
         self.export_page = self._build_export()
-        for widget in (self.overview_page, self.games_page, self.openings_page, self.compare_page, self.favorites_page, self.export_page):
+        for widget in (
+            self.overview_page,
+            self.games_page,
+            self.openings_page,
+            self.compare_page,
+            self.favorites_page,
+            self.training_page,
+            self.progress_page,
+            self.export_page,
+        ):
             self.tabs.addWidget(widget)
         content.addWidget(self.tabs, 1)
         root.addLayout(content, 1)
@@ -788,6 +925,316 @@ class Insight8x8App(QMainWindow):
         layout.addWidget(self.compare_scroll, 1)
         return page
 
+    def _build_training(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        toolbar = QHBoxLayout()
+        self.training_status = QLabel("Analyse games to unlock personalised coaching.")
+        self.training_status.setObjectName("muted")
+        self.training_status.setWordWrap(True)
+        build = QPushButton("Build coaching")
+        build.setProperty("primary", True)
+        build.clicked.connect(self._build_training_data)
+        reset = QPushButton("Reset session")
+        reset.clicked.connect(self._reset_training_session)
+        toolbar.addWidget(self.training_status, 1)
+        toolbar.addWidget(reset)
+        toolbar.addWidget(build)
+        layout.addLayout(toolbar)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(2, 2, 12, 2)
+        inner_layout.setSpacing(14)
+        self.lessons_panel, self.lessons_layout = make_panel("Personal lessons")
+        inner_layout.addWidget(self.lessons_panel)
+        exercise_panel, exercise_layout = make_panel("Practice")
+        self.training_board = ChessBoard()
+        self.training_board.setMinimumSize(280, 280)
+        self.training_board.setMaximumSize(380, 380)
+        self.training_prompt = QLabel("Run Stockfish analysis on a game, then build your coaching plan.")
+        self.training_prompt.setObjectName("viewerTitle")
+        self.training_prompt.setWordWrap(True)
+        self.training_options_layout = QVBoxLayout()
+        self.training_feedback = QLabel()
+        self.training_feedback.setObjectName("muted")
+        self.training_feedback.setWordWrap(True)
+        self.training_score = QLabel()
+        self.training_score.setObjectName("muted")
+        self.next_exercise_button = QPushButton("Next exercise")
+        self.next_exercise_button.clicked.connect(self._next_training_exercise)
+        board_row = QHBoxLayout()
+        board_row.addWidget(self.training_board, 0, Qt.AlignmentFlag.AlignCenter)
+        details = QVBoxLayout()
+        details.addWidget(self.training_prompt)
+        details.addLayout(self.training_options_layout)
+        details.addWidget(self.training_feedback)
+        details.addWidget(self.training_score)
+        details.addWidget(self.next_exercise_button)
+        details.addStretch()
+        board_row.addLayout(details, 1)
+        exercise_layout.addLayout(board_row)
+        inner_layout.addWidget(exercise_panel)
+        scroll.setWidget(inner)
+        layout.addWidget(scroll)
+        return page
+
+    def _build_progress(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        self.progress_inner_layout = QVBoxLayout(inner)
+        self.progress_inner_layout.setContentsMargins(2, 2, 12, 2)
+        self.progress_inner_layout.setSpacing(14)
+        scroll.setWidget(inner)
+        layout.addWidget(scroll)
+        return page
+
+    def _save_game_analysis(self, game_id, result):
+        if not self.username or not game_id:
+            return
+        game = next((item for item in self.games if item.get("id") == game_id), {})
+        self.store.set_training(
+            self.username,
+            f"analysis:{game_id}",
+            {
+                "game_id": game_id,
+                "date": game.get("date"),
+                "color": game.get("color"),
+                "opponent": game.get("opponent"),
+                "timeClass": game.get("timeClass"),
+                "playerRating": game.get("playerRating"),
+                "analysis": result,
+            },
+        )
+        self.status.showMessage(f"Analysis saved for coaching · {game_id}")
+
+    def _collect_analyses(self):
+        if not self.username:
+            return []
+        values = self.store.all_training(self.username)
+        return [
+            value
+            for key, value in values.items()
+            if key.startswith("analysis:") and isinstance(value, dict) and value.get("analysis")
+        ]
+
+    def _build_training_data(self):
+        analyses = self._collect_analyses()
+        if not analyses:
+            QMessageBox.information(
+                self,
+                "Insight8x8",
+                "Analyse at least one game first. Coaching is built from your saved Stockfish analyses.",
+            )
+            return
+        self.training_status.setText("Building personalised lessons…")
+        llm = self.coach if getattr(self.coach, "available", False) else None
+        worker = self._track(FunctionWorker(build_coaching_data, analyses, self.store, self.username, llm))
+        worker.succeeded.connect(self._training_data_ready)
+        worker.failed.connect(
+            lambda message: self.training_status.setText(f"Coaching failed: {message}")
+        )
+        worker.start()
+
+    def _training_data_ready(self, data):
+        self.training.update(data)
+        self.training["current"] = None
+        self.training["index"] = 0
+        self.training["correct"] = 0
+        self.training["answered"] = 0
+        self.training_status.setText(
+            f"Built {len(self.training['lessons'])} lessons and {len(self.training['exercises'])} exercises "
+            f"from {len(self._collect_analyses())} analysed games."
+        )
+        self._refresh_training()
+        self._refresh_progress()
+
+    def _refresh_training(self):
+        if not hasattr(self, "lessons_layout"):
+            return
+        clear_layout(self.lessons_layout)
+        lessons = self.training.get("lessons") or []
+        if not lessons:
+            label = QLabel("No lessons yet. Analyse a game, then choose Build coaching.")
+            label.setObjectName("muted")
+            label.setWordWrap(True)
+            self.lessons_layout.addWidget(label)
+        for lesson in lessons[:6]:
+            panel, panel_layout = make_panel()
+            heading = QLabel(f"{lesson.get('title', 'Lesson')} · {lesson.get('severity', 'medium')}")
+            heading.setObjectName("viewerTitle")
+            summary = QLabel(lesson.get("summary", ""))
+            summary.setObjectName("muted")
+            summary.setWordWrap(True)
+            panel_layout.addWidget(heading)
+            panel_layout.addWidget(summary)
+            for step in lesson.get("steps") or []:
+                item = QLabel(f"• {step}")
+                item.setWordWrap(True)
+                panel_layout.addWidget(item)
+            self.lessons_layout.addWidget(panel)
+        exercises = self.training.get("exercises") or []
+        if not exercises:
+            self.training_prompt.setText("No exercises yet. Analyse games and build your coaching plan.")
+            self.training_feedback.setText("")
+            self.training_score.setText("")
+            clear_layout(self.training_options_layout)
+            self.training_board.set_position(DEMO_FEN)
+            self.next_exercise_button.setEnabled(False)
+            return
+        if self.training.get("current") is None:
+            self.training["index"] = 0
+            self._show_training_exercise()
+        else:
+            self._show_training_exercise()
+
+    def _show_training_exercise(self):
+        exercises = self.training.get("exercises") or []
+        index = int(self.training.get("index") or 0)
+        if index >= len(exercises):
+            self._finish_training_session()
+            return
+        exercise = exercises[index]
+        self.training["current"] = exercise
+        self.training_board.set_position(exercise.get("fen", DEMO_FEN))
+        self.training_prompt.setText(
+            f"Exercise {index + 1}/{len(exercises)} · {exercise.get('prompt', '')}"
+        )
+        self.training_feedback.setText("")
+        self.training_score.setText(
+            f"Answered {self.training.get('answered', 0)} · Correct {self.training.get('correct', 0)}"
+        )
+        self.next_exercise_button.setEnabled(False)
+        clear_layout(self.training_options_layout)
+        for option in exercise.get("options") or []:
+            button = QPushButton(str(option))
+            button.clicked.connect(
+                lambda checked=False, value=option: self._answer_training(value)
+            )
+            self.training_options_layout.addWidget(button)
+
+    def _answer_training(self, option):
+        exercise = self.training.get("current")
+        if not exercise or self.next_exercise_button.isEnabled():
+            return
+        correct = str(option) == str(exercise.get("answer"))
+        if correct:
+            self.training["correct"] += 1
+        self.training["answered"] += 1
+        focus = self.settings.value("coachingFocus", "Balanced", type=str)
+        record_progress(
+            self.store,
+            self.username,
+            {"focus": focus, "correct": int(correct), "total": 1},
+        )
+        feedback = "Correct." if correct else f"Not quite — {exercise.get('answer')} is stronger."
+        explanation = exercise.get("explanation") or exercise.get("whyBetter") or ""
+        if explanation:
+            feedback += f" {explanation}"
+        self.training_feedback.setText(feedback)
+        self.training_score.setText(
+            f"Answered {self.training['answered']} · Correct {self.training['correct']}"
+        )
+        self.next_exercise_button.setEnabled(True)
+        for index in range(self.training_options_layout.count()):
+            item = self.training_options_layout.itemAt(index)
+            if item and item.widget():
+                item.widget().setEnabled(False)
+
+    def _next_training_exercise(self):
+        self.training["index"] = int(self.training.get("index") or 0) + 1
+        self._show_training_exercise()
+
+    def _finish_training_session(self):
+        answered = int(self.training.get("answered") or 0)
+        correct = int(self.training.get("correct") or 0)
+        self.training["current"] = None
+        self.training["index"] = 0
+        self.next_exercise_button.setEnabled(False)
+        QMessageBox.information(
+            self,
+            "Insight8x8",
+            f"Session complete: {correct}/{answered} correct. Your results are on the Progress tab.",
+        )
+        self._refresh_progress()
+
+    def _reset_training_session(self):
+        self.training["current"] = None
+        self.training["index"] = 0
+        self.training["correct"] = 0
+        self.training["answered"] = 0
+        self._refresh_training()
+
+    def _refresh_progress(self):
+        if not hasattr(self, "progress_inner_layout"):
+            return
+        clear_layout(self.progress_inner_layout)
+        summary = improvement_summary(progress_history(self.store, self.username))
+        cards, card_layout = make_panel()
+        grid = QGridLayout()
+        stats = [
+            ("Sessions", fmt_number(summary["sessions"]), "Completed training runs"),
+            ("Accuracy", f"{summary['accuracy']}%", "Average across sessions"),
+            ("Trend", f"{summary['trend']:+.1f}%", "Recent five sessions"),
+            ("Best streak", fmt_number(summary["bestStreak"]), "Sessions at 80%+"),
+        ]
+        for index, (title, value, hint) in enumerate(stats):
+            grid.addWidget(StatCard(title, value, hint), index // 2, index % 2)
+        card_layout.addLayout(grid)
+        self.progress_inner_layout.addWidget(cards)
+        if summary["labels"]:
+            chart_panel, chart_layout = make_panel("Accuracy over time")
+            chart = LineChart()
+            chart.set_data(
+                summary["labels"],
+                [{"name": "Accuracy", "color": "#5fd39a", "values": summary["accuracySeries"]}],
+            )
+            chart.setMinimumHeight(220)
+            chart_layout.addWidget(chart)
+            self.progress_inner_layout.addWidget(chart_panel)
+        if summary["focus"]:
+            focus_panel, focus_layout = make_panel("Training focus")
+            chart = BarChart()
+            chart.set_data(
+                [item["label"] for item in summary["focus"]],
+                [item["count"] for item in summary["focus"]],
+            )
+            chart.setMinimumHeight(200)
+            focus_layout.addWidget(chart)
+            self.progress_inner_layout.addWidget(focus_panel)
+        history_panel, history_layout = make_panel("Recent sessions")
+        records = progress_history(self.store, self.username)[-8:]
+        if not records:
+            label = QLabel("No training sessions yet. Answer exercises on the Training tab.")
+            label.setObjectName("muted")
+            history_layout.addWidget(label)
+        for item in reversed(records):
+            total = int(item.get("total") or 0)
+            correct = int(item.get("correct") or 0)
+            accuracy = round(100 * correct / total) if total else 0
+            history_layout.addWidget(
+                QLabel(
+                    f"{item.get('date', '')} · {item.get('focus', 'mixed')} · "
+                    f"{correct}/{total} · {accuracy}%"
+                )
+            )
+        self.progress_inner_layout.addWidget(history_panel)
+        report_panel, report_layout = make_panel("Training report")
+        note = QLabel("Download a CSV summary of sessions, lessons and recommended exercises.")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        report_button = QPushButton("Download training report")
+        report_button.clicked.connect(lambda: self.export_file("training_report"))
+        report_layout.addWidget(note)
+        report_layout.addWidget(report_button)
+        self.progress_inner_layout.addWidget(report_panel)
+
     def _build_export(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -806,6 +1253,7 @@ class Insight8x8App(QMainWindow):
             ("Match history CSV", "Opponents, ratings, results, openings and links in spreadsheet form.", "Download CSV", lambda: self.export_file("csv")),
             ("Favorites", "Saved games stay available in the local application database.", "View favorites", lambda: self.show_tab("favorites")),
             ("Engine analysis", "Open any game and run Stockfish to see why each move matters.", "Open a game", self._open_first_game),
+            ("Training report", "Download lessons, exercises and progress history as a CSV report.", "Download report", lambda: self.export_file("training_report")),
         ]
         for index, (title, body, button_text, handler) in enumerate(cards):
             row, col = divmod(index + 2, 2)
@@ -833,7 +1281,7 @@ class Insight8x8App(QMainWindow):
         scope_row.addWidget(self.export_scope)
         scope_row.addWidget(scope_note, 1)
         scope_layout.addLayout(scope_row)
-        grid.addWidget(scope_panel, 4, 0, 1, 2)
+        grid.addWidget(scope_panel, 5, 0, 1, 2)
         scroll.setWidget(inner)
         layout.addWidget(scroll)
         return page
@@ -981,6 +1429,8 @@ class Insight8x8App(QMainWindow):
         self._refresh_games(False)
         self._refresh_games(True)
         self._refresh_openings()
+        self._refresh_training()
+        self._refresh_progress()
         self._refresh_export()
 
     def _refresh_sidebar(self):
@@ -1006,6 +1456,8 @@ class Insight8x8App(QMainWindow):
             "openings": self.openings_page,
             "compare": self.compare_page,
             "favorites": self.favorites_page,
+            "training": self.training_page,
+            "progress": self.progress_page,
             "export": self.export_page,
         }
         page = pages.get(key)
@@ -1018,6 +1470,8 @@ class Insight8x8App(QMainWindow):
             "openings": "Opening repertoire",
             "compare": "Player comparison",
             "favorites": "Favorite games",
+            "training": "Training",
+            "progress": "Progress",
             "export": "Export center",
         }
         self.page_title.setText(titles[key])
@@ -1038,6 +1492,10 @@ class Insight8x8App(QMainWindow):
             self._refresh_games(True)
         elif key == "openings":
             self._refresh_openings()
+        elif key == "training":
+            self._refresh_training()
+        elif key == "progress":
+            self._refresh_progress()
         elif key == "export":
             self._refresh_export()
 
@@ -1051,6 +1509,19 @@ class Insight8x8App(QMainWindow):
         self.load_progress.setVisible(False)
         self.archive_hint.hide()
         self.settings.remove("username")
+        self.training.update(
+            {
+                "lessons": [],
+                "exercises": [],
+                "weaknesses": [],
+                "current": None,
+                "index": 0,
+                "correct": 0,
+                "answered": 0,
+            }
+        )
+        self._refresh_training()
+        self._refresh_progress()
         clear_layout(self.compare_result_layout)
         self.compare_input.clear()
         self.page_subtitle.setText("")
@@ -1541,6 +2012,7 @@ class Insight8x8App(QMainWindow):
             **self._analysis_options(),
         )
         viewer.favorite_toggled.connect(self.toggle_favorite)
+        viewer.analysis_saved.connect(self._save_game_analysis)
         viewer.show()
         self.viewers.append(viewer)
         viewer.destroyed.connect(lambda: self.viewers.remove(viewer) if viewer in self.viewers else None)
@@ -1567,10 +2039,21 @@ class Insight8x8App(QMainWindow):
             self.export_summary.setText(
                 f"{fmt_number(count)} {label}{'' if count == 1 else 's'} in the current export scope · "
                 f"{fmt_number(len(self.games))} games loaded · {fmt_number(len(self.favorites))} favorites · "
+                f"{fmt_number(len(progress_history(self.store, self.username)))} training sessions · "
                 f"Local database: {self.store.path}"
             )
 
     def _export_text(self, kind, favorites_only=False):
+        if kind == "training_report":
+            analyses = self._collect_analyses()
+            data = build_coaching_data(analyses, self.store, self.username)
+            return training_report(
+                self.store,
+                self.username,
+                data["lessons"],
+                data["exercises"],
+                data["history"],
+            )
         selected_ids = {game["id"] for game in self._filtered_games(favorites_only)}
         details = [
             game for game in self.client.all_game_details(self.username)
@@ -1598,15 +2081,26 @@ class Insight8x8App(QMainWindow):
     def export_file(self, kind):
         favorites_only = hasattr(self, "export_scope") and self.export_scope.currentIndex() == 1
         scope = "favorites" if favorites_only else "games"
-        if not self._filtered_games(favorites_only):
-            QMessageBox.information(self, "Insight8x8", f"There are no {scope} to export with the current filters.")
-            return
-        suffix = "pgn" if kind == "pgn" else "csv"
-        caption = "Save PGN collection" if kind == "pgn" else "Save match history CSV"
+        if kind == "training_report":
+            if not progress_history(self.store, self.username) and not self._collect_analyses():
+                QMessageBox.information(
+                    self, "Insight8x8", "No training progress or analyses to export yet."
+                )
+                return
+            suffix = "csv"
+            caption = "Save training report"
+            default_name = f"{self.username or 'insight8x8'}-training-report.csv"
+        else:
+            if not self._filtered_games(favorites_only):
+                QMessageBox.information(self, "Insight8x8", f"There are no {scope} to export with the current filters.")
+                return
+            suffix = "pgn" if kind == "pgn" else "csv"
+            caption = "Save PGN collection" if kind == "pgn" else "Save match history CSV"
+            default_name = f"{self.username}-{scope}.{suffix}"
         filename, _ = QFileDialog.getSaveFileName(
             self,
             caption,
-            f"{self.username}-{scope}.{suffix}",
+            default_name,
             f"{suffix.upper()} files (*.{suffix});;All files (*)",
         )
         if not filename:

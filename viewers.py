@@ -33,6 +33,7 @@ from workers import AnalysisWorker
 
 class GameViewerDialog(QWidget):
     favorite_toggled = pyqtSignal(str)
+    analysis_saved = pyqtSignal(str, object)
 
     def __init__(self, game, analyzer, is_favorite=False, parent=None, depth=12, movetime=150):
         super().__init__(parent, Qt.WindowType.Window)
@@ -459,8 +460,16 @@ class GameViewerDialog(QWidget):
         self.engine_button.setEnabled(False)
         self.engine_button.setText("Analyzing…")
         self.analysis_progress.setText("Starting Stockfish analysis…")
+        player_color = "w" if self.game.get("color") == "white" else "b"
         worker = AnalysisWorker(
-            self.analyzer, self.positions, self.moves, depth=self.depth, movetime=self.movetime
+            self.analyzer,
+            self.positions,
+            self.moves,
+            depth=self.depth,
+            movetime=self.movetime,
+            player_rating=self.game.get("playerRating"),
+            opponent_rating=self.game.get("opponentRating"),
+            player_color=player_color,
         )
         self.worker = worker
 
@@ -488,6 +497,7 @@ class GameViewerDialog(QWidget):
         self.engine_button.setText("Analyze all moves")
         self.analysis_progress.setText(f"Analysis complete · {len(result.get('moves') or {})} moves")
         self.analysis_summary_label.setText(self._format_analysis_summary(result))
+        self.analysis_saved.emit(self.game.get("id", ""), result)
         self._fill_move_list()
         self._set_ply(self.ply)
 
@@ -515,6 +525,15 @@ class GameViewerDialog(QWidget):
             lines.append(f"Centipawn loss: {fmt_number(loss)} — {classification}")
         elif classification:
             lines.append(f"Classification: {classification}")
+        explanation = entry.get("explanation")
+        if explanation:
+            lines.append(f"Why: {explanation}")
+        why_better = entry.get("whyBetter")
+        if why_better:
+            lines.append(f"Better move: {why_better}")
+        motifs = entry.get("motifs") or []
+        if motifs:
+            lines.append("Move themes: " + ", ".join(motifs))
         candidates = entry.get("candidates") or []
         if candidates:
             lines.append("Top 3 candidates:")
